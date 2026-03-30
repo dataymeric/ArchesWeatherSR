@@ -1,0 +1,15 @@
+dataset:
+  _target_: geoarches.dataloaders.era5_hdf5.ERA5Downscaling
+  lowres_path: era5/240x121/weatherbench2/yearly
+  highres_path: era5/1440x721/weatherbench2/yearly
+  lead_time_hours: 24
+  norm_scheme: era5
+  domain: train
+  load_prev: False
+  multistep: 0
+
+validation_args:
+  domain: val_z0012
+
+test_args:
+  domain: test_z0012

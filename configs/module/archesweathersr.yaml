@@ -1,0 +1,71 @@
+project: super-resolution
+
+module:
+  _target_: archesweathersr.lightning_modules.sr_flow_matching.DownscalingDiffusionModule
+  name: ${name}
+  cond_dim: 256
+  scheduler: euler
+  prediction_type: sample
+  conditional: "" # or teacher to include past states as conditioning
+
+  interp_args:
+    mode: "bicubic" # "bilinear", "trilinear", "bicubic"
+    align_corners: False
+
+  # scales
+  state_normalization: residual
+  pow: 2.0
+
+  # opt
+  lr: 3e-4
+  betas: [0.9, 0.98] # try a 0.999 for betas ? and bigger bs ?
+  weight_decay: 0.01
+  num_warmup_steps: 5000
+  num_training_steps: ${max_steps}
+
+defaults:
+  - metrics: # Read from module/metrics/ folder.
+      - era5_ensemble
+
+val:
+  num_members: 2
+  metrics: ${oc.dict.values:module.metrics}
+  metrics_kwargs:
+    save_memory: True # memory constraints
+
+inference:
+  num_steps: 25
+  num_members: 2
+  cf_guidance: 1
+  s_churn: 0.0
+  save_test_outputs: False
+  metrics: ${module.metrics}
+  metrics_kwargs:
+    save_memory: True # memory constraints
+
+backbone:
+  # default backbone
+  _target_: archesweathersr.backbones.archesweather.ArchesWeatherCondBackbone
+  tensor_size: [8, 180, 360] # after embed = number of patches
+  emb_dim: 192
+  cond_dim: 256
+  window_size: [1, 6, 12] # 8 x 30 x 30 windows
+  droppath_coeff: 0.2
+  dropout: 0
+  depth_multiplier: 1 # 16 base layers * depth_multiplier
+  use_skip: True
+  first_interaction_layer: linear
+  axis_attn: True
+  mlp_layer: swiglu
+  mlp_ratio: 4.0
+  gradient_checkpointing: True
+
+embedder:
+  _target_: archesweathersr.backbones.archesweather.WeatherEncodeDecodeLayer
+  img_size: [13, 721, 1440]
+  emb_dim: 192
+  out_emb_dim: 384
+  patch_size: [2, 4, 4]
+  surface_ch: 4
+  level_ch: 6
+  n_concatenated_states: 1

@@ -1,0 +1,29 @@
+# Specify which configs to use.
+defaults:
+  - cluster: example
+  - dataloader: era5downscaling-hdf5
+  - module: archesweathersr
+  - override hydra/job_logging: none
+  - override hydra/hydra_logging: none
+  - _self_
+
+
+# Wandb logging
+log: False
+entity:
+project: ${module.project}
+name: default
+
+exp_dir: modelstore/${name} # Checkpoint dir
+resume: True  # To resume a previous run, loads checkpoint and cfg from `exp_dir`.
+
+seed: None
+max_steps: 75000
+batch_size: ${cluster.batch_size}
+
+save_step_frequency: 2500
+log_freq: 100
+limit_val_batches: 0.1
+accumulate_grad_batches: 1
+
+mode: train  # Specify "train" or "test" to run training or inference.

@@ -1,0 +1,9 @@
+wandb_mode: offline
+use_custom_requeue: False
+
+precision: bf16-mixed
+batch_size: 1
+gpus: 4
+cpus: 8
+num_nodes: 1
+

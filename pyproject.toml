@@ -1,0 +1,26 @@
+[project]
+name = "archesweathersr"
+version = "0.1.0"
+description = "Super-Resolving Coarse-Resolution Weather Forecasts with Flow Matching"
+authors = [{ name = "Aymeric Delefosse" }]
+requires-python = ">=3.11,<3.13"
+readme = "README.md"
+license = "BSD-3-Clause"
+
+dependencies = [
+    "geoarches",
+    "h5py>=3.16.0",
+    "hdf5plugin>=6.0.0",
+    "torchdata>=0.11.0",
+    "xarray-regrid>=0.4.2",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.ruff]
+line-length = 88
+
+[tool.uv.sources]
+geoarches = { git = "https://github.com/INRIA/geoarches" }
