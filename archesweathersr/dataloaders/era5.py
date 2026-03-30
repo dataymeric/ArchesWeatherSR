@@ -14,18 +14,20 @@ from .netcdf import XarrayDataset
 
 filename_filters = dict(
     all=(lambda _: True),
-    last_train=lambda x: ("2018" in x),
-    last_train_z0012=lambda x: ("2018" in x and ("0h" in x or "12h" in x)),
+    last_train=lambda x: "2018" in x,
+    last_train_z0012=lambda x: "2018" in x and ("0h" in x or "12h" in x),
     train=lambda x: not ("2019" in x or "2020" in x or "2021" in x),
     # Splits val and test are from 2019 and 2020 respectively, but
     # we read the years before and after to account for offsets when
     # loading previous and future timestamps for an example.
-    val=lambda x: ("2018" in x or "2019" in x or "2020" in x),
-    test=lambda x: ("2019" in x or "2020" in x or "2021" in x),
-    test_z0012=lambda x: ("2019" in x or "2020" in x or "2021" in x)
-    and ("0h" in x or "12h" in x),
-    test2022_z0012=lambda x: ("2022" in x)
-    and ("0h" in x or "12h" in x),  # check if that works ?
+    val=lambda x: "2018" in x or "2019" in x or "2020" in x,
+    test=lambda x: "2019" in x or "2020" in x or "2021" in x,
+    test_z0012=lambda x: (
+        ("2019" in x or "2020" in x or "2021" in x) and ("0h" in x or "12h" in x)
+    ),
+    test2022_z0012=lambda x: (
+        ("2022" in x) and ("0h" in x or "12h" in x)
+    ),  # check if that works ?
     recent2=lambda x: any([str(y) in x for y in range(2007, 2019)]),
     empty=lambda x: False,
 )

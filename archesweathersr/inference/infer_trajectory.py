@@ -1,15 +1,43 @@
-"""
-AWG+SR trajectory rollout.
+"""AWG + SR coupled trajectory rollout.
 
-Processes exactly ONE TASK (time slice) and generates multiple ensemble members.
-Each member:
- - runs AWG rollout for n_steps
- - applies SR to each step
- - regrids back to lowres
- - feeds regridded output back to AWG
+Each script invocation processes exactly one task (a single initialization
+time slice) and generates a configurable number of ensemble members.
+For each member the following closed-loop pipeline is executed for
+``n_steps`` steps:
 
-Usage (example):
-  python infer_trajectory.py --task-id 0
+1. **AWG forecast** - the ArchesWeatherGen model predicts the next
+   atmospheric state in AWG-normalized space.
+2. **Denormalize** - the AWG output is converted to physical units
+   (low-resolution, ~1.5°).
+3. **SR inference** - the low-resolution physical state is normalized with
+   ERA5 statistics and passed to the SR model, which produces a
+   high-resolution (~0.25°) physical state.
+4. **Conservative regridding** - the high-resolution SR output is regridded
+   back to the low-resolution AWG grid using ``xarray_regrid``.
+5. **Renormalize for AWG** - the regridded physical state is converted to
+   AWG-normalized space and fed as the initial condition for the next step.
+
+Three trajectory types are saved per task:
+
+- ``lowres`` - low-resolution physical states from AWG (1.5°).
+- ``highres`` - high-resolution physical states from SR (0.25°).
+- ``regrid`` - SR output conservatively regridded back to 1.5°.
+
+Output files are named ``task{idx:03d}_{type}_traj.nc`` and written to
+``--output-dir``.  Intermediate per-member files are placed in a temporary
+subdirectory and cleaned up automatically.
+
+Example:
+    Run trajectory rollout for task 0 with default paths::
+
+        python infer_trajectory.py --task-id 0
+
+    Override the number of members and rollout steps::
+
+        python infer_trajectory.py \\
+            --task-id 3 \\
+            --num-ensemble-members 50 \\
+            --num-rollout-steps 14
 """
 
 import argparse
@@ -49,9 +77,29 @@ DEFAULT_SR_MODULE = "downscaling-era5-2"
 
 
 def prepare_sr_inputs_for_model(batch_tdict: TensorDict, timestamps_sec: torch.Tensor):
-    """
-    Prepare SR model inputs from TensorDict and timestamp.
-    Common pattern: pass 'surface', 'level', and 'timestamp' (seconds).
+    """Build the input dictionary expected by the SR model.
+
+    Packages a normalized low-resolution state together with a randomly
+    initialized high-resolution noise field and a timestamp into the nested
+    dictionary format consumed by the SR flow-matching model.
+
+    Args:
+        batch_tdict: Normalised low-resolution state with keys ``"surface"``
+            (shape ``[B, surface_vars, 1, lat, lon]``) and ``"level"``
+            (shape ``[B, level_vars, pressure_levels, lat, lon]``).
+        timestamps_sec: Unix timestamps in seconds for each batch element,
+            shape ``[B]``.
+
+    Returns:
+        A nested dictionary with the structure::
+
+            {
+                "timestamp": Tensor,          # shape [B], on DEVICE
+                "state": {
+                    "lowres": TensorDict,     # surface + level, on DEVICE
+                    "highres": TensorDict,    # random noise, on DEVICE
+                },
+            }
     """
     input = {
         "timestamp": timestamps_sec.to(DEVICE),
@@ -74,7 +122,19 @@ def prepare_sr_inputs_for_model(batch_tdict: TensorDict, timestamps_sec: torch.T
 
 
 def make_target_regrid_dataset(res_lat=1.5, res_lon=1.5):
-    """Create target grid for conservative regridding."""
+    """Create a target ``xr.Dataset`` for conservative regridding.
+
+    Builds a regular lat/lon grid covering the full globe and converts it to
+    the dataset format expected by ``xarray_regrid``.
+
+    Args:
+        res_lat: Latitude resolution in degrees. Defaults to ``1.5``.
+        res_lon: Longitude resolution in degrees. Defaults to ``1.5``.
+
+    Returns:
+        An ``xr.Dataset`` representing the target grid, as returned by
+        ``xarray_regrid.Grid.create_regridding_dataset``.
+    """
     grid = Grid(
         north=90,
         east=360 - res_lon,
@@ -113,18 +173,65 @@ def rollout_awg_sr_regrid(
     # awg kwargs
     awg_kwargs=None,
 ):
-    """
-    Pipeline:
-      phys(t) -> AWG_norm(t) -> AWG predicts AWG_norm(t+1)
-      -> phys(t+1) -> SR_norm(t+1) -> SR predicts SR_norm_hi(t+1)
-      -> phys_hi(t+1) -> regrid -> phys_low(t+1)
-      -> AWG_norm_low(t+1) fed as state for next step
+    """Run the coupled AWG → SR → regrid → AWG rollout for one ensemble member.
 
-    Stores (lists):
-      lowres_awg_norm_xr : lowres, AWG-normalized, for debugging
-      lowres_phys_xr     : lowres, physical
-      sr_high_phys_xr    : highres, physical
-      sr_regrid_phys_xr  : lowres, physical (after regrid)
+    At each step the pipeline is:
+
+    .. code-block:: text
+
+        phys(t) → AWG_norm(t) → AWG predicts AWG_norm(t+1)
+          → phys(t+1) → SR_norm(t+1) → SR predicts SR_norm_hi(t+1)
+          → phys_hi(t+1) → conservative regrid → phys_low(t+1)
+          → AWG_norm_low(t+1) fed as state for next step
+
+    Decorated with ``@torch.no_grad()``.
+
+    Args:
+        dataset: ``Era5Forecast`` dataset used to fetch the initial condition
+            at ``task_idx``.
+        task_idx: Index into ``dataset`` identifying the initial condition.
+        n_steps: Number of rollout steps to generate (t+1 … t+n_steps).
+            Defaults to ``10``.
+        lead_time_hours: Hours between successive forecast steps.
+            Defaults to ``24``.
+        device: Torch device string, e.g. ``"cuda:0"`` or ``"cpu"``.
+        era5_awg_like: ``Era5Forecast`` instance carrying AWG normalization
+            statistics (Pangu scheme).
+        era5_sr_like: ``Era5Forecast`` instance carrying SR normalization
+            statistics (ERA5 scheme).
+        awg: Loaded AWG lightning module used to predict the next state.
+        sr_model: Loaded SR lightning module used to super-resolve each step.
+        prepare_sr_inputs_for_model: Callable that packs a normalized
+            low-resolution ``TensorDict`` and a timestamp tensor into the
+            nested input dict expected by ``sr_model.sample``.
+        regrid_target_dataset: Target grid dataset for conservative regridding.
+            Created via :func:`make_target_regrid_dataset` if ``None``.
+        regrid_vars: List of variable names to regrid.  Defaults to
+            ``level_variables + surface_variables``.
+        skipna: Whether to skip NaN values during regridding.
+            Defaults to ``False``.
+        latitude_coord: Name of the latitude coordinate in the xarray dataset.
+            Defaults to ``"latitude"``.
+        member: Zero-based ensemble member index; used to offset random seeds.
+            Defaults to ``0``.
+        batch_nb: Batch number; used to offset random seeds for multi-batch
+            parallelism.  Defaults to ``0``.
+        seed_base_awg: Base random seed for the AWG model.
+            Defaults to ``123_000``.
+        seed_base_sr: Base random seed for the SR model.  Derived from
+            ``task_idx`` if ``None``.
+        awg_kwargs: Extra keyword arguments forwarded to ``awg.sample``.
+            Currently unused (reserved for future extension).
+
+    Returns:
+        A dictionary with four keys, each containing a list of ``n_steps``
+        ``xr.Dataset`` objects:
+
+        - ``"lowres_awg_norm_xr"`` - low-resolution, AWG-normalized (debug).
+        - ``"lowres_phys_xr"`` - low-resolution, physical units.
+        - ``"sr_high_phys_xr"`` - high-resolution, physical units (SR output).
+        - ``"sr_regrid_phys_xr"`` - high-resolution SR output conservatively
+          regridded back to the low-resolution AWG grid, physical units.
     """
     if regrid_target_dataset is None:
         regrid_target_dataset = make_target_regrid_dataset(1.5, 1.5)
@@ -241,9 +348,28 @@ def save_member_trajectories(
     task_idx: int,
     member_idx: int,
 ):
-    """
-    Save trajectories for a single member to temporary files.
-    Returns paths to saved files.
+    """Write the three trajectory types for one ensemble member to disk.
+
+    Concatenates per-step ``xr.Dataset`` lists from ``out`` along the
+    ``"time"`` dimension, subsets to pressure levels
+    ``[300, 500, 700, 850]`` hPa, and saves each type to its own NetCDF file
+    in ``temp_dir``.
+
+    Args:
+        out: Output dictionary returned by :func:`rollout_awg_sr_regrid`,
+            containing lists of ``xr.Dataset`` objects for keys
+            ``"lowres_phys_xr"``, ``"sr_high_phys_xr"``, and
+            ``"sr_regrid_phys_xr"``.
+        temp_dir: Directory in which temporary files are written (created if
+            it does not exist).
+        task_idx: Task index; used in the output filenames.
+        member_idx: Zero-based ensemble member index; used in the output
+            filenames.
+
+    Returns:
+        A dictionary mapping trajectory type keys ``"lowres"``, ``"highres"``,
+        and ``"regrid"`` to the corresponding ``Path`` objects of the written
+        files.
     """
     temp_dir.mkdir(parents=True, exist_ok=True)
 
@@ -284,9 +410,22 @@ def combine_member_trajectories(
     task_idx: int,
     num_members: int,
 ):
-    """
-    Load and combine all member trajectories into final datasets.
-    Cleans up temporary files after saving.
+    """Concatenate per-member trajectory files into final ensemble output.
+
+    For each of the three trajectory types (``"lowres"``, ``"highres"``,
+    ``"regrid"``), reads all member files, concatenates them along a new
+    ``"number"`` dimension, converts the ``"time"`` coordinate to
+    ``"prediction_timedelta"`` (with ``"time"`` re-added as the
+    initialisation time), and writes the result to ``out_dir``.  The
+    temporary directory is removed on completion.
+
+    Args:
+        temp_dir: Directory containing the per-member files written by
+            :func:`save_member_trajectories`.
+        out_dir: Destination directory for the final NetCDF files (created if
+            it does not exist).
+        task_idx: Task index; used in input and output filenames.
+        num_members: Number of ensemble members to load and combine.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -354,7 +493,37 @@ def main(
     num_rollout_steps: int = NUM_ROLLOUT_STEPS,
     lead_time_hours: int = LEAD_TIME_HOURS,
 ):
-    """Main function to run AWG+SR trajectory rollout for a single task."""
+    """Entry point for coupled AWG + SR trajectory rollout.
+
+    Indexes all NetCDF files matching ``inputs_glob``, maps ``task_id`` to a
+    specific ``(file, time_slice)`` pair, loads the AWG and SR models, and
+    runs :func:`rollout_awg_sr_regrid` once per ensemble member.  Each
+    member's trajectories are saved to disk immediately after generation to
+    bound peak memory usage.  All members are then concatenated by
+    :func:`combine_member_trajectories` into the final output files.
+
+    Decorated with ``@torch.no_grad()``.
+
+    Args:
+        task_id: Zero-based index into the flattened list of
+            ``(file, time_slice)`` pairs across all input files.  Used to
+            distribute work across parallel jobs.  Defaults to ``0``.
+        inputs_glob: Glob pattern for input NetCDF rollout files.
+            Defaults to ``DEFAULT_INPUTS_GLOB``.
+        output_dir: Directory where final output files are written.
+            Defaults to ``DEFAULT_OUTPUT_DIR``.
+        era5_path: Path to the ERA5 dataset used for AWG normalisation.
+            Defaults to ``DEFAULT_ERA5_PATH``.
+        num_ensemble_members: Number of ensemble members to generate.
+            Defaults to ``NUM_ENSEMBLE_MEMBERS``.
+        num_rollout_steps: Number of AWG + SR steps per member.
+            Defaults to ``NUM_ROLLOUT_STEPS``.
+        lead_time_hours: Hours between successive forecast steps.
+            Defaults to ``LEAD_TIME_HOURS``.
+
+    Raises:
+        FileNotFoundError: If no files match ``inputs_glob``.
+    """
 
     files = sorted(glob.glob(inputs_glob))
     if not files:

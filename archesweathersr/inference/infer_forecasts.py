@@ -1,15 +1,32 @@
-"""
-Super-resolve ArchesWeather rollout files.
+"""Super-resolve ArchesWeather forecasts files.
 
-Processes exactly ONE TIME SLICE from one NetCDF file,
-iterating its (number, prediction_timedelta) samples. For each sample:
- - compute valid_time = time + prediction_timedelta
- - convert to TensorDict via Era5Forecast.convert_to_tensordict()
- - pass timestamp=valid_time (seconds) to SR model
- - save SR results to a NetCDF named after the input file + time index
+Each script invocation handles exactly one task, identified by ``--task-id``.
+A task corresponds to a single initialization time (time slice) taken from the
+pool of NetCDF files that match ``--inputs-glob``.  For that time slice every
+(number, prediction_timedelta) combination is processed:
 
-Usage (example):
-  python infer_forecasts.py --task-id 0
+1. The valid time is computed as ``init_time + prediction_timedelta``.
+2. The low-resolution forecast state is converted to a normalised
+   ``TensorDict`` via ``Era5Forecast.convert_to_tensordict``.
+3. The SR model is called with ``timestamp=valid_time`` (Unix seconds).
+4. Super-resolved outputs are written to a NetCDF file named after the
+   input file stem and time index.
+
+Lead times are processed in batches to bound peak GPU/CPU memory usage.
+Intermediate per-member, per-SR-sample, per-batch files are stored in a
+temporary directory and cleaned up once the final combined file is written.
+
+Example:
+    Run super-resolution for task 0 with default paths::
+
+        python infer_forecasts.py --task-id 0
+
+    Override input glob and output directory::
+
+        python infer_forecasts.py \\
+            --task-id 5 \\
+            --inputs-glob "data/forecasts/*.nc" \\
+            --output-dir "data/sr_forecasts"
 """
 
 import argparse
@@ -36,9 +53,29 @@ NUM_SR_SAMPLES = 1  # Number of SR samples to generate per input sample
 
 
 def prepare_sr_inputs_for_model(batch_tdict: TensorDict, timestamps_sec: torch.Tensor):
-    """
-    TODO: adapt to your SR model's expected input structure.
-    Common pattern in your stack is to pass 'surface', 'level', and 'timestamp' (seconds).
+    """Build the input dictionary expected by the SR model.
+
+    Packages a normalized low-resolution state together with a randomly
+    initialized high-resolution noise field and a timestamp into the nested
+    dictionary format consumed by the SR flow-matching model.
+
+    Args:
+        batch_tdict: Normalised low-resolution state with keys ``"surface"``
+            (shape ``[B, surface_vars, 1, lat, lon]``) and ``"level"``
+            (shape ``[B, level_vars, pressure_levels, lat, lon]``).
+        timestamps_sec: Unix timestamps in seconds for each batch element,
+            shape ``[B]``.
+
+    Returns:
+        A nested dictionary with the structure::
+
+            {
+                "timestamp": Tensor,          # shape [B], on DEVICE
+                "state": {
+                    "lowres": TensorDict,     # surface + level, on DEVICE
+                    "highres": TensorDict,    # random noise, on DEVICE
+                },
+            }
     """
     input = {
         "timestamp": timestamps_sec.to(DEVICE),
@@ -61,10 +98,21 @@ def prepare_sr_inputs_for_model(batch_tdict: TensorDict, timestamps_sec: torch.T
 
 
 def iter_samples_from_time_slice(ds_time: xr.Dataset):
-    """
-    Yield (xr_slice, valid_time_npdt64, init_time) for each (number, prediction_timedelta).
-    ds_time is already a single-time slice Dataset.
-    xr_slice is a single-member/lead slice Dataset (ready for convert_to_tensordict).
+    """Iterate over all (ensemble member, lead time) combinations in a time slice.
+
+    Args:
+        ds_time: A single-time-slice ``xr.Dataset`` with dimensions
+            ``number`` and ``prediction_timedelta``.
+
+    Yields:
+        A tuple ``(xr_slice, valid_time, init_time)`` where:
+
+        - ``xr_slice`` – single-member/lead ``xr.Dataset`` ready for
+          ``Era5Forecast.convert_to_tensordict``.
+        - ``valid_time`` – ``np.datetime64[ns]`` equal to
+          ``init_time + prediction_timedelta``.
+        - ``init_time`` – ``np.datetime64[ns]`` initialisation time of the
+          forecast.
     """
     init_time = ds_time["time"].values  # np.datetime64[ns]
     numbers = ds_time["number"].values
@@ -87,9 +135,28 @@ def save_sr_batch_leadtimes(
     sr_sample_idx: int,
     batch_idx: int,
 ):
-    """
-    Save a batch of lead times for a specific (member, SR sample) pair.
-    Memory-efficient: processes batches of lead times at a time.
+    """Denormalize and write a batch of SR lead-time outputs to a NetCDF file.
+
+    Stacks a list of per-lead-time ``TensorDict`` objects into a single
+    trajectory, converts it to ``xr.Dataset`` via
+    ``Era5Forecast.convert_trajectory_to_xarray``, and saves the result to a
+    temporary file named by ``(member_idx, sr_sample_idx, batch_idx)``.
+
+    Args:
+        sr_tdict_list: List of SR output ``TensorDict`` objects, one per lead
+            time, each with shape ``[1, vars, ...]`` on CPU.
+        era5_like: ``Era5Forecast`` instance used for denormalization and
+            xarray conversion.
+        init_time_sec: Forecast initialization time as a Unix timestamp
+            (seconds).
+        temp_dir: Directory in which the temporary batch file is written.
+        member_idx: Zero-based ensemble member index; used in the filename.
+        sr_sample_idx: Zero-based SR sample index; used in the filename.
+        batch_idx: Zero-based batch index within this member/SR-sample pair;
+            used in the filename.
+
+    Returns:
+        Path to the written temporary NetCDF file.
     """
     # Stack into single TensorDict with shape [B, T, ...]
     batch_trajectory = TensorDict(
@@ -127,9 +194,21 @@ def combine_batches_into_trajectory(
     sr_sample_idx: int,
     num_batches: int,
 ):
-    """
-    Combine batch files into a single trajectory file.
-    Returns the path to the combined trajectory file.
+    """Concatenate batch NetCDF files into a single trajectory file.
+
+    Reads all batch files belonging to a ``(member_idx, sr_sample_idx)`` pair,
+    concatenates them along the ``prediction_timedelta`` dimension, and saves
+    the result.  Batch files are deleted after concatenation.  If only one
+    batch exists the file is simply renamed without loading it into memory.
+
+    Args:
+        temp_dir: Directory containing the batch files.
+        member_idx: Zero-based ensemble member index.
+        sr_sample_idx: Zero-based SR sample index.
+        num_batches: Total number of batch files to combine.
+
+    Returns:
+        Path to the combined trajectory NetCDF file.
     """
     batch_files = []
     for bi in range(num_batches):
@@ -174,9 +253,27 @@ def combine_saved_trajectories(
     num_sr_samples: int,
     has_number_dim: bool = True,
 ):
-    """
-    Load and combine all saved trajectories into final dataset.
-    Cleans up temporary files after saving.
+    """Assemble per-member trajectory files into the final output NetCDF.
+
+    Reads all per-member, per-SR-sample trajectory files from ``temp_dir``,
+    concatenates SR samples along a new ``sr_sample`` dimension (when
+    ``num_sr_samples > 1``), concatenates ensemble members along the
+    ``number`` dimension (when the input data has that dimension and
+    ``num_members > 1``), and writes the combined dataset to ``out_dir``.
+    The entire temporary directory is removed on completion.
+
+    Args:
+        temp_dir: Directory containing the per-member trajectory files written
+            by :func:`combine_batches_into_trajectory`.
+        out_dir: Destination directory for the final NetCDF file.
+        in_stem: Stem of the input NetCDF filename, used to construct the
+            output filename.
+        time_idx: Time-slice index within the input file, used in the output
+            filename.
+        num_members: Number of ensemble members (or 1 for deterministic).
+        num_sr_samples: Number of SR samples generated per member.
+        has_number_dim: Whether the original input had a ``number`` dimension.
+            Defaults to ``True``.
     """
     members_list = []
 
@@ -239,6 +336,30 @@ def main(
     output_dir: str = DEFAULT_OUTPUT_DIR,
     num_sr_samples: int = NUM_SR_SAMPLES,
 ):
+    """Entry point for SR forecast inference.
+
+    Indexes all NetCDF files matching ``inputs_glob``, maps ``task_id`` to a
+    specific ``(file, time_slice)`` pair, and runs super-resolution over every
+    ``(ensemble_member, lead_time)`` combination in that time slice.
+    Lead times are processed in batches of 10 to keep peak memory bounded.
+    Results are written to ``{output_dir}/{in_stem}_time{time_idx:03d}_sr.nc``.
+
+    Decorated with ``@torch.no_grad()`` — no gradients are computed.
+
+    Args:
+        task_id: Zero-based index into the flattened list of
+            ``(file, time_slice)`` pairs across all input files.  Used to
+            distribute work across parallel jobs.  Defaults to ``0``.
+        inputs_glob: Glob pattern for input NetCDF forecast files.
+            Defaults to ``DEFAULT_INPUTS_GLOB``.
+        output_dir: Directory where SR output files are written.
+            Defaults to ``DEFAULT_OUTPUT_DIR``.
+        num_sr_samples: Number of independent SR samples to generate per
+            ``(member, lead_time)`` pair.  Defaults to ``NUM_SR_SAMPLES``.
+
+    Raises:
+        FileNotFoundError: If no files match ``inputs_glob``.
+    """
     files = sorted(glob.glob(inputs_glob))
     if not files:
         raise FileNotFoundError(f"No files match: {inputs_glob}")

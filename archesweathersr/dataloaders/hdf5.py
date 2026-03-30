@@ -18,8 +18,9 @@ def get_filter_mask(domain: str, time: pd.DatetimeIndex) -> np.ndarray:
         "last_train": lambda t: t.year == 2018,
         "last_train_z0012": lambda t: (t.year == 2018) & (t.hour.isin([0, 12])),
         "train": lambda t: ~t.year.isin([2019, 2020, 2021]),
-        "train_z0012": lambda t: ~t.year.isin([2019, 2020, 2021])
-        & t.hour.isin([0, 12]),
+        "train_z0012": lambda t: (
+            ~t.year.isin([2019, 2020, 2021]) & t.hour.isin([0, 12])
+        ),
         "val": lambda t: t.year.isin([2018, 2019, 2020]),
         "val_z0012": lambda t: t.year.isin([2018, 2019, 2020]) & t.hour.isin([0, 12]),
         "test": lambda t: t.year.isin([2019, 2020, 2021]),
