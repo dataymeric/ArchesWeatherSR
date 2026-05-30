@@ -1,6 +1,9 @@
 # Super-Resolving Coarse-Resolution Weather Forecasts with Flow Matching
 
-ArchesWeatherSR extends [ArchesWeather & ArchesWeatherGen](https://github.com/INRIA/geoarches) with a super-resolution module: it takes a coarse-resolution (1.5°) weather forecast produced by ArchesWeatherGen and generates an ensemble of plausible high-resolution (0.25°) fields using a flow matching diffusion model. The model learns to predict the residual between a bicubic upsampling of the low-resolution forecast and the ERA5 analysis at 0.25°.
+[![arXiv](https://img.shields.io/badge/arXiv-2604.00897-b31b1b.svg)](https://arxiv.org/abs/2604.00897)
+[![Hugging Face](https://img.shields.io/badge/🤗%20Hugging%20Face-dataymeric%2FArchesWeatherSR-ffd21e)](https://huggingface.co/dataymeric/ArchesWeatherSR)
+
+ArchesWeatherSR is a flow matching–based generative super-resolution model for global weather forecasts. It takes a coarse-resolution (1.5°) forecast and generates an ensemble of plausible high-resolution (0.25°) fields, recovering fine-scale variability while preserving large-scale structure. As demonstrated on [ArchesWeatherGen](https://github.com/INRIA/geoarches) forecasts in the companion paper.
 
 ![](assets/archesweathersr_overview.png)
 
@@ -8,10 +11,10 @@ For more information, see the [geoarches](https://geoarches.readthedocs.io/en/la
 
 ## Installation
 
-We recommended using [uv](https://docs.astral.sh/uv/) to manage the environment. After cloning the repo, run:
+We recommend using [uv](https://docs.astral.sh/uv/) to manage the environment. After cloning the repo, run:
 
 ```bash
-git clone <this-repo>
+git clone https://github.com/dataymeric/ArchesWeatherSR.git
 cd archesweathersr
 uv sync
 ```
@@ -33,16 +36,23 @@ python train.py \
 
 ### Data
 
-ERA5 data was obtained from [WeatherBench2](https://weatherbench2.readthedocs.io/en/latest/data-guide.html). We recommended downloading the data in HDF5 format for use with the `dataloaders.era5_hdf5` dataloader. We provide a small download script with `scripts/dl_era.py`.
+ERA5 data was obtained from [WeatherBench2](https://weatherbench2.readthedocs.io/en/latest/data-guide.html). We recommend downloading the data in HDF5 format for use with the `dataloaders.era5_hdf5` dataloader. We provide a small download script with `scripts/dl_era.py`.
 
 ## Inference
 
-### Simple evaluation
+### Pretrained model
+
+A pretrained model is available on [Hugging Face](https://huggingface.co/dataymeric/ArchesWeatherSR). Download the weights with:
 
 ```bash
-python train.py mode=test ++name=my_run
+hf download dataymeric/ArchesWeatherSR --local-dir runs/archesweathersr
 ```
-Metrics will be saved to `evalstore/<name>/`.
+
+Then run inference pointing to that directory:
+
+```bash
+python train.py mode=test ++name=archesweathersr
+```
 
 ### Super-resolving ArchesWeatherGen forecasts
 
@@ -63,3 +73,17 @@ python -m archesweathersr.inference.infer_forecasts --task-id $SLURM_ARRAY_TASK_
 ```
 
 We provide a script to produce ArchesWeatherGen rollouts in the correct format for super-resolution with `scripts/rollout_archesweathergen.py`. This requires [downloading the pretrained models](https://geoarches.readthedocs.io/en/latest/archesweather/setup/#2-download-pretrained-models).
+
+## Citation
+
+```bibtex
+@preprint{delefosse2026archesweathersr,
+  title         = {Super-Resolving Coarse-Resolution Weather Forecasts With Flow Matching},
+  author        = {Delefosse, Aymeric and Charantonis, Anastase and B{\'e}r{\'e}ziat, Dominique},
+  year          = {2026},
+  eprint        = {2604.00897},
+  archiveprefix = {arXiv},
+  primaryclass  = {cs.LG},
+  doi           = {10.48550/arXiv.2604.00897}
+}
+```
