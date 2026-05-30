@@ -1,6 +1,6 @@
 [project]
 name = "archesweathersr"
-version = "0.1.0"
+version = "1.0.0"
 description = "Super-Resolving Coarse-Resolution Weather Forecasts with Flow Matching"
 authors = [{ name = "Aymeric Delefosse" }]
 requires-python = ">=3.11,<3.13"
@@ -8,6 +8,7 @@ readme = "README.md"
 license = "BSD-3-Clause"
 
 dependencies = [
+    "blosc2>=4.1.2",
     "geoarches",
     "h5py>=3.16.0",
     "hdf5plugin>=6.0.0",

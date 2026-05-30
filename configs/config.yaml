@@ -8,13 +8,13 @@ defaults:
   - _self_
 
 
-# Wandb logging
+# W&B logging
 log: False
 entity:
 project: ${module.project}
 name: default
 
-exp_dir: modelstore/${name} # Checkpoint dir
+exp_dir: runs/${name}
 resume: True  # To resume a previous run, loads checkpoint and cfg from `exp_dir`.
 
 seed: None
@@ -23,7 +23,7 @@ batch_size: ${cluster.batch_size}
 
 save_step_frequency: 2500
 log_freq: 100
-limit_val_batches: 0.1
+limit_val_batches: 1.0
 accumulate_grad_batches: 1
 
 mode: train  # Specify "train" or "test" to run training or inference.

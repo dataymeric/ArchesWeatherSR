@@ -119,14 +119,14 @@ class DownscalingDiffusionModule(BaseLightningModule):
             self.era5_std = TensorDict(
                 level=era5_stats["level"]["std"], surface=era5_stats["surface"]["std"]
             )
-            scaler_file = (
-                str(archesweathersr_stats_path / "sr_residual_norm_bicubic.pt")
+            scaler_filename = (
+                "sr_residual_norm_bicubic.pt"
                 if interp_args["mode"] == "bicubic"
-                else str(archesweathersr_stats_path / "sr_residual_norm_linear.pt")
+                else "sr_residual_norm_linear.pt"
             )
             scaler = TensorDict(
                 **torch.load(
-                    str(archesweathersr_stats_path / scaler_file), weights_only=False
+                    str(archesweathersr_stats_path / scaler_filename), weights_only=True
                 )
             )
             self.state_scaler = (
@@ -298,13 +298,66 @@ class DownscalingDiffusionModule(BaseLightningModule):
         return up_lowres_state + out
 
     def validation_step(self, batch, batch_nb):
-        val_num_members = self.cfg.val.num_members
+        device, bs = batch["state"]["lowres"].device, batch["state"]["lowres"].shape[0]
+
+        # Always: loss computation
+        if self.sd3_timestep_sampling:
+            u = torch.normal(mean=0, std=1, size=(bs,), device="cpu").sigmoid()
+            indices = (u * self.noise_scheduler.config.num_train_timesteps).long()
+        else:
+            indices = torch.randint(
+                0, self.noise_scheduler.config.num_train_timesteps, (bs,)
+            ).long()
+
+        schedule_timesteps = self.noise_scheduler.timesteps.to(device)
+        timesteps = self.noise_scheduler.timesteps[indices].to(device)
+
+        sigmas = self.noise_scheduler.sigmas.to(
+            device=device, dtype=batch["state"]["lowres"].dtype
+        )
+        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+        sigma = sigmas[step_indices].flatten()[:, None, None, None, None]
+
+        noise = torch.randn_like(batch["state"]["highres"])
+        up_lowres_state = tensordict_interp(
+            batch["state"]["lowres"],
+            target=batch["state"]["highres"],
+            **self.interp_args,
+        )
+        residual = batch["state"]["highres"] - up_lowres_state
+        if self.state_normalization:
+            residual = tensordict_apply(
+                torch.div, residual, self.state_scaler.to(self.device)
+            )
+
+        noisy_state = noise.apply(lambda x: x * sigma) + residual.apply(
+            lambda x: x * (1.0 - sigma)
+        )
+        target_state = (
+            residual if self.prediction_type == "sample" else noise - residual
+        )
+
+        pred = self.forward(batch, noisy_state, timesteps)
+        loss = self.loss(pred, target_state, timesteps)
+        self.log(
+            "val/loss",
+            loss,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+            prog_bar=True,
+        )
+
+        # Periodically: full reverse diffusion + metrics
+        sample_every_n = getattr(self.cfg.val, "sample_every_n_epochs", 1)
+        if self.current_epoch % sample_every_n != 0:
+            return
 
         samples = [
             self.sample(batch, seed=j + batch_nb * 10**6, disable_tqdm=True).unsqueeze(
                 1
             )
-            for j in tqdm(range(val_num_members))
+            for j in tqdm(range(self.cfg.val.num_members))
         ]
 
         denormalize = self.trainer.val_dataloaders.dataset.denormalize
@@ -315,6 +368,10 @@ class DownscalingDiffusionModule(BaseLightningModule):
             metric.update(targets, preds)
 
     def on_validation_epoch_end(self):
+        sample_every_n = getattr(self.cfg.val, "sample_every_n_epochs", 1)
+        if self.current_epoch % sample_every_n != 0:
+            return
+
         for metric in self.val_metrics:
             scores = metric.compute()
             self.log_dict(scores, sync_dist=True)

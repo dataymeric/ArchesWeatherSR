@@ -4,6 +4,6 @@ use_custom_requeue: False
 precision: bf16-mixed
 batch_size: 1
 gpus: 4
-cpus: 8
+num_workers: 8
+blosc_nthreads: 3  # num_workers * blosc_nthreads <= cpus-per-task (24)
 num_nodes: 1
-

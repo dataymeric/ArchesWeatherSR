@@ -124,7 +124,7 @@ def main(cfg: DictConfig):
             project=cfg.project,
             name=cfg.name,
             id=run_id,
-            save_dir="wandblogs",
+            save_dir=f"{cfg.exp_dir}/wandblogs",
             offline=(cfg.cluster.wandb_mode != "online"),
             resume="allow",
         )
@@ -137,6 +137,11 @@ def main(cfg: DictConfig):
         with open(Path(cfg.exp_dir) / "config.yaml", "w") as f:
             f.write(OmegaConf.to_yaml(cfg, resolve=True))
 
+    def worker_init_fn(worker_id):
+        import blosc2
+
+        blosc2.set_nthreads(cfg.cluster.blosc_nthreads)
+
     if cfg.mode == "train":
         console_logger.info("Setting up validation dataloader...")
         val_args = getattr(cfg.dataloader, "validation_args", {})
@@ -144,10 +149,11 @@ def main(cfg: DictConfig):
         val_loader = StatefulDataLoader(
             val_set,
             batch_size=cfg.batch_size,
-            num_workers=cfg.cluster.cpus,
+            num_workers=cfg.cluster.num_workers,
             shuffle=True,
             collate_fn=collate_fn,
             persistent_workers=True,
+            worker_init_fn=worker_init_fn,
             snapshot_every_n_steps=cfg.save_step_frequency,
         )
 
@@ -156,10 +162,12 @@ def main(cfg: DictConfig):
         train_loader = StatefulDataLoader(
             train_set,
             batch_size=cfg.batch_size,
-            num_workers=cfg.cluster.cpus,
+            num_workers=cfg.cluster.num_workers,
             shuffle=True,
+            prefetch_factor=4,
             collate_fn=collate_fn,
             persistent_workers=True,
+            worker_init_fn=worker_init_fn,
             snapshot_every_n_steps=cfg.save_step_frequency,
         )
 
@@ -170,7 +178,7 @@ def main(cfg: DictConfig):
         test_loader = StatefulDataLoader(
             test_set,
             batch_size=cfg.batch_size,
-            num_workers=cfg.cluster.cpus,
+            num_workers=cfg.cluster.num_workers,
             shuffle=True,  # avoid correlated batches
             collate_fn=collate_fn,
             persistent_workers=True,
@@ -200,6 +208,7 @@ def main(cfg: DictConfig):
     torch.set_float32_matmul_precision("medium")
 
     trainer = Trainer(
+        default_root_dir=f"{cfg.exp_dir}",
         devices="auto",
         accelerator="auto",
         strategy="ddp" if torch.cuda.is_available() else "auto",

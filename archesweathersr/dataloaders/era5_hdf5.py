@@ -1,4 +1,3 @@
-import gc
 import importlib.resources
 from typing import Dict, List, Optional, cast
 
@@ -36,7 +35,7 @@ class ERA5Dataset(HDF5Dataset):
         super().__init__(
             path,
             variables=variables,
-            warning_on_nan=True,
+            warning_on_nan=False,
         )
 
         self.filter_timestamps(domain=domain)
@@ -273,7 +272,6 @@ class ERA5Downscaling(torch.utils.data.Dataset):
                     "highres": highres_data_dict[key],
                 }
 
-        gc.collect()
         return combined_data
 
     def denormalize(self, batch):

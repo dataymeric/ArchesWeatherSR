@@ -88,8 +88,7 @@ class HDF5Dataset(torch.utils.data.Dataset):
         mode = "pre-stacked" if isinstance(variables, list) else "per-variable"
         self.console_logger.info(f"HDF5 mode: {mode}.")
 
-        self.cached_file = None
-        self.cached_file_idx = None
+        self._file_handles: dict[int, h5py.File] = {}
 
     def _discover_files(self, path: str):
         """Identifies and lists files in the given path."""
@@ -211,19 +210,16 @@ class HDF5Dataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.timestamps)
 
-    def __getitem__(self, i, return_timestamp=False):  # type: ignore[override]
-        file_idx, time_idx, timestamp = self.timestamps[i]
-
-        if self.cached_file_idx != file_idx:
-            if self.cached_file is not None:
-                self.cached_file.close()
-            self.cached_file = h5py.File(
+    def _get_handle(self, file_idx: int) -> h5py.File:
+        if file_idx not in self._file_handles:
+            self._file_handles[file_idx] = h5py.File(
                 self.files[file_idx].decode("UTF-8"), mode="r", libver="latest"
             )
-            self.cached_file_idx = file_idx
+        return self._file_handles[file_idx]
 
-        assert self.cached_file is not None
-        f = self.cached_file
+    def __getitem__(self, i, return_timestamp=False):  # type: ignore[override]
+        file_idx, time_idx, timestamp = self.timestamps[i]
+        f = self._get_handle(file_idx)
 
         if isinstance(self.variables, list):
             # Pre-stacked: each key is already a stacked dataset, load directly.
